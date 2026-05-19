@@ -72,6 +72,7 @@ metrics_persist_task = None
 sweeper_bg_task = None
 single_process_lock_file = None
 STALE_QUEUE_TTL = 300
+SHUTDOWN_TASK_TIMEOUT = float(os.getenv("MIMO_SHUTDOWN_TASK_TIMEOUT", "5"))
 
 def sweep_stale_queues_once(now: float | None = None) -> int:
     now = time.time() if now is None else now
@@ -96,6 +97,36 @@ async def sweep_stale_queues():
         except Exception as e:
             logger.error(f"清理死锁队列任务发生异常: {e}")
 
+
+async def close_active_clients() -> None:
+    clients = list(state.active_clients)
+    if not clients:
+        return
+
+    logger.info(f"🛑 正在关闭 {len(clients)} 个内网节点连接...")
+    for client in clients:
+        try:
+            await client.close()
+        except Exception as exc:
+            logger.debug(f"关闭内网节点连接失败: {exc}")
+
+
+async def cancel_and_wait_tasks(tasks: list[asyncio.Task | None], *, label: str) -> None:
+    pending = [task for task in tasks if task is not None and not task.done()]
+    if not pending:
+        return
+
+    for task in pending:
+        task.cancel()
+
+    try:
+        await asyncio.wait_for(asyncio.gather(*pending, return_exceptions=True), timeout=SHUTDOWN_TASK_TIMEOUT)
+    except asyncio.TimeoutError:
+        still_running = [task for task in pending if not task.done()]
+        logger.warning(
+            f"⚠️ 关闭 {label} 超时，{len(still_running)} 个任务在 {SHUTDOWN_TASK_TIMEOUT}s 内未退出"
+        )
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global manager_bg_task, metrics_persist_task, sweeper_bg_task
@@ -107,21 +138,24 @@ async def lifespan(app: FastAPI):
     if fixed:
         logger.info(f"🔧 重新分类了 {fixed} 条历史状态记录")
         
-    manager_bg_task = asyncio.create_task(start_manager_tasks())
-    metrics_persist_task = asyncio.create_task(metrics_history_worker())
-    sweeper_bg_task = asyncio.create_task(sweep_stale_queues()) # 启动巡检死神
+    manager_bg_task = asyncio.create_task(start_manager_tasks(), name="mimo-manager")
+    metrics_persist_task = asyncio.create_task(metrics_history_worker(), name="mimo-metrics")
+    sweeper_bg_task = asyncio.create_task(sweep_stale_queues(), name="mimo-sweeper") # 启动巡检死神
     
     yield
-    
-    for task in [manager_bg_task, metrics_persist_task, sweeper_bg_task]:
-        if task:
-            task.cancel()
-    if metrics_persist_task:
-        try:
-            await metrics_persist_task
-        except asyncio.CancelledError:
-            pass
-    release_single_process_lock()
+
+    try:
+        await close_active_clients()
+        await cancel_and_wait_tasks(
+            [manager_bg_task, metrics_persist_task, sweeper_bg_task],
+            label="核心后台任务",
+        )
+        await cancel_and_wait_tasks(list(_background_tasks), label="转发清理任务")
+    finally:
+        manager_bg_task = None
+        metrics_persist_task = None
+        sweeper_bg_task = None
+        release_single_process_lock()
 
 app = FastAPI(lifespan=lifespan)
 
@@ -137,7 +171,7 @@ NODE_RESPONSE_TIMEOUT = 30
 MAX_RETRIES = 3
 MAX_PENDING_QUEUES = 2000
 AI_ROUTE_PREFIXES = ("/v1/", "/anthropic/v1/")
-WEBUI_PUBLIC_PATHS = {"/", "/webui", "/api/auth/session", "/api/auth/login", "/api/auth/logout"}
+WEBUI_PUBLIC_PATHS = {"/", "/api/auth/session", "/api/auth/login", "/api/auth/logout", "/api/stats", "/api/status/history", "/webui"}
 
 if is_ai_auth_enabled():
     logger.info("🔐 AI API 鉴权已启用")
@@ -942,4 +976,10 @@ async def _forward_request(request: Request, path: str):
 
 if __name__ == "__main__":
     logger.info("🚀 启动支持多节点的公网网关...")
-    uvicorn.run(app, host="0.0.0.0", port=8000, ws_max_size=10**8)
+    uvicorn.run(
+        app,
+        host="0.0.0.0",
+        port=8000,
+        ws_max_size=10**8,
+        timeout_graceful_shutdown=int(SHUTDOWN_TASK_TIMEOUT),
+    )

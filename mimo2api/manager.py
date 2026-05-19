@@ -30,6 +30,20 @@ async def interruptible_sleep(seconds: int):
     except asyncio.TimeoutError:
         pass
 
+
+async def cancel_and_wait(tasks: list[asyncio.Task], timeout: float = 5.0) -> None:
+    pending = [task for task in tasks if not task.done()]
+    if not pending:
+        return
+
+    for task in pending:
+        task.cancel()
+
+    try:
+        await asyncio.wait_for(asyncio.gather(*pending, return_exceptions=True), timeout=timeout)
+    except asyncio.TimeoutError:
+        logger.warning(f"取消子任务超时，仍有 {sum(not task.done() for task in pending)} 个任务未退出")
+
 def trigger_rebuild():
     """供外部调用，触发所有账号强制重建"""
     rebuild_event.set()
@@ -281,7 +295,7 @@ class NativeClawClient:
             return False
 
         self.connected = False
-        self._listen_task = asyncio.create_task(self._ws_loop())
+        self._listen_task = asyncio.create_task(self._ws_loop(), name=f"claw-listener-{self.logger.name}")
         
         # 等待后台 loop 处理 hello-ok 完成鉴权挂载
         for _ in range(50):
@@ -354,9 +368,15 @@ class NativeClawClient:
             self._listen_task.cancel()
         if self.ws:
             try:
-                await self.ws.close()
+                await asyncio.wait_for(self.ws.close(), timeout=2)
             except Exception:
                 pass
+        if self._listen_task:
+            try:
+                await asyncio.gather(self._listen_task, return_exceptions=True)
+            finally:
+                self._listen_task = None
+        self.ws = None
 
 
 # ----------------- 单账号并发管理器 -----------------
@@ -539,14 +559,18 @@ async def start_manager_tasks():
             await asyncio.sleep(init_sleep)
         await mgr.run_lifecycle()
 
-    for i, (uid, user_info) in enumerate(users.items()):
-        stagger_offset = i * stagger_step
-        manager = AccountManager(uid, user_info, stagger_offset=stagger_offset)
-        # 初始启动小幅错开 3 秒，避免并发导致 API 短期拒绝
-        t = asyncio.create_task(_delayed_start(manager, i * 3.0))
-        tasks.append(t)
-    
-    await asyncio.gather(*tasks, return_exceptions=True)
+    try:
+        for i, (uid, user_info) in enumerate(users.items()):
+            stagger_offset = i * stagger_step
+            manager = AccountManager(uid, user_info, stagger_offset=stagger_offset)
+            # 初始启动小幅错开 3 秒，避免并发导致 API 短期拒绝
+            t = asyncio.create_task(_delayed_start(manager, i * 3.0), name=f"account-manager-{uid}")
+            tasks.append(t)
+
+        await asyncio.gather(*tasks, return_exceptions=True)
+    except asyncio.CancelledError:
+        await cancel_and_wait(tasks)
+        raise
 
 async def main():
     await start_manager_tasks()

@@ -133,6 +133,12 @@ def _parse_response_input_item(raw_item: Any) -> RespItem | None:
         return RespMessageItem(role="user", content=str(raw_item))
 
     item_type = raw_item.get("type")
+    if not item_type and ("role" in raw_item or "content" in raw_item):
+        role = raw_item.get("role") or "user"
+        if role not in {"system", "user", "assistant", "developer"}:
+            role = "user"
+        return RespMessageItem(role=role, content=raw_item.get("content", []))
+
     if item_type == "reasoning":
         item = dict(raw_item)
         if item.get("summary") is None:
